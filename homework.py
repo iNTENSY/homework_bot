@@ -2,25 +2,26 @@ import logging
 import os
 import sys
 import time
-from http import HTTPStatus
-from typing import Dict
-
 import requests
 import telegram
 
+from http import HTTPStatus
+from typing import Dict
 from dotenv import load_dotenv
+
+from exceptions import BadHTTPStatusError, BadRequestError, HomeworkError
 
 load_dotenv()
 
-PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('CHAT_ID')
+PRACTICUM_TOKEN: str = os.getenv('PRACTICUM_TOKEN')
+TELEGRAM_TOKEN: str = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID: str = os.getenv('CHAT_ID')
 
-RETRY_PERIOD = 600
-ENDPOINT = 'https://practicum.yandex.ru/api/user_api/homework_statuses/'
-HEADERS = {'Authorization': f'OAuth {PRACTICUM_TOKEN}'}
+RETRY_PERIOD: int = 600
+ENDPOINT: str = 'https://practicum.yandex.ru/api/user_api/homework_statuses/'
+HEADERS: Dict[str, str] = {'Authorization': f'OAuth {PRACTICUM_TOKEN}'}
 
-HOMEWORK_VERDICTS = {
+HOMEWORK_VERDICTS: Dict[str, str] = {
     'approved': 'Работа проверена: ревьюеру всё понравилось. Ура!',
     'reviewing': 'Работа взята на проверку ревьюером.',
     'rejected': 'Работа проверена: у ревьюера есть замечания.'
@@ -36,7 +37,9 @@ EXCEPTION_MESSAGES: Dict[str, str] = {
     'has_not_homework': 'Отсутствует домашняя работа',
     'bad_verdict_status': ('Полученный статус не входит '
                            'в список ожидаемых в HOMEWORK_VERDICTS'),
-    'server_error': 'Сбой в работе программы'
+    'server_error': 'Сбой в работе программы',
+    'bad_request': 'При обработке вашего запроса '
+                   'произошло неоднозначное исключение.'
 }
 
 logger = logging.getLogger(__name__)
@@ -48,11 +51,11 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 
-def check_tokens():
+def check_tokens() -> bool:
     """
     Данная функция проверяет наличие токенов.
     К списку относится PRACTICUM_TOKEN, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID.
-    В случае их отсутствия - программа завершает свое выполнение.
+    В случае их отсутствия программа возвращает False, иначе True.
     """
     logging.debug('Проверка наличия требуемых токенов...')
 
@@ -61,13 +64,12 @@ def check_tokens():
             logging.critical(
                 EXCEPTION_MESSAGES['token_not_found'].format(param)
             )
-    if not all((PRACTICUM_TOKEN, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)):
-        exit('Программа принудительно остановлена.')
+    return all((PRACTICUM_TOKEN, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID))
 
 
 def send_message(bot: telegram.Bot, message: str) -> None:
     """Данная функция выполняет отправку сообщений пользователю."""
-    exception_message: str = ('Бот отправил сообщение '
+    exception_message: str = ('Бот не отправил сообщение: '
                               f'{EXCEPTION_MESSAGES["endpoint_denied"]}')
     default_chat_message: str = ('Бот успешно отправил '
                                  f'сообщение {message} пользователю с '
@@ -78,30 +80,25 @@ def send_message(bot: telegram.Bot, message: str) -> None:
                          text=message)
     except telegram.TelegramError:
         logger.error(exception_message)
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-                         text=EXCEPTION_MESSAGES['endpoint_denied'])
-        logger.debug(exception_message)
     else:
         logger.debug(default_chat_message)
 
 
-def get_api_answer(timestamp):
+def get_api_answer(timestamp) -> dict:
     """Данная функция выполняет проверку статус-кода запроса к ENDPOINT."""
-    params: Dict[str, int] = {'from_date': timestamp}
+    params: Dict[str, str | dict] = {
+        'url': ENDPOINT,
+        'headers': HEADERS,
+        'params': {'from_date': timestamp}
+    }
     try:
-        response = requests.get(url=ENDPOINT, headers=HEADERS, params=params)
+        response = requests.get(**params)
         if response.status_code != HTTPStatus.OK:
-            raise requests.exceptions.HTTPError(
-                EXCEPTION_MESSAGES['endpoint_denied']
-            )
-    except requests.exceptions.HTTPError as http_error:
-        logger.error(http_error)
-        raise TypeError(http_error)
+            raise BadHTTPStatusError(f"HTTP Status: {response.status_code}"
+                                     + EXCEPTION_MESSAGES['endpoint_denied'])
     except requests.RequestException as error:
-        logger.error(error)
-        raise TypeError(error)
-    else:
-        return response.json()
+        raise BadRequestError(EXCEPTION_MESSAGES['bad_request'] + f'| {error}')
+    return response.json()
 
 
 def check_response(response):
@@ -111,21 +108,18 @@ def check_response(response):
     Функция возвращает первый элемент в списке "homeworks"
     """
     if not isinstance(response, dict):
-        logger.error(EXCEPTION_MESSAGES['bad_response_format'])
         raise TypeError(EXCEPTION_MESSAGES['bad_response_format'])
 
     homeworks = response.get('homeworks')
 
     if homeworks is None:
-        logger.error(EXCEPTION_MESSAGES['missing_homework'])
-        raise TypeError(EXCEPTION_MESSAGES['missing_homework'])
+        raise HomeworkError(EXCEPTION_MESSAGES['missing_homework'])
     if not isinstance(homeworks, list):
-        logger.error(EXCEPTION_MESSAGES['bad_homework_format'])
         raise TypeError(EXCEPTION_MESSAGES['bad_homework_format'])
     return homeworks[0]
 
 
-def parse_status(homework):
+def parse_status(homework) -> str:
     """
     Данная функция обрабатывает статус-код домашней работы (далее ДР).
     В случае, когда отсутствует название или статус
@@ -134,22 +128,24 @@ def parse_status(homework):
     """
     logger.debug(f'Обработка данных: {homework}')
 
-    homework_name = homework.get('homework_name')
-    current_status = homework.get('status')
+    homework_name: str = homework.get('homework_name')
+    current_status: str = homework.get('status')
 
     if not homework_name:
-        raise KeyError(EXCEPTION_MESSAGES['has_not_homework'])
+        raise HomeworkError(EXCEPTION_MESSAGES['has_not_homework'])
 
     if current_status not in HOMEWORK_VERDICTS:
-        raise NameError(EXCEPTION_MESSAGES['bad_status'])
+        raise HomeworkError(EXCEPTION_MESSAGES['bad_status'])
 
     verdict = HOMEWORK_VERDICTS.get(current_status)
     return f'Изменился статус проверки работы "{homework_name}". {verdict}'
 
 
-def main():
+def main() -> None:
     """Основная логика работы бота."""
-    check_tokens()
+    if not check_tokens():
+        logger.critical('Программа принудительно остановлена')
+        exit('Программа принудительно остановлена')
 
     bot = telegram.Bot(token=TELEGRAM_TOKEN)
     timestamp = int(time.time())
@@ -163,7 +159,11 @@ def main():
                 message_by_status = parse_status(response)
                 send_message(bot, message_by_status)
                 logger.info(message_by_status)
-
+        except (BadRequestError,
+                BadHTTPStatusError,
+                HomeworkError,
+                TypeError) as error:
+            logger.error(error)
         except IndexError:
             message = 'Статус домашней работы не изменился!'
             send_message(bot, message)
