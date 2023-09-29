@@ -31,7 +31,8 @@ EXCEPTION_MESSAGES: Dict[str, str] = {
     'token_not_found': 'Отсутствует обязательная переменная окружения: "{}"',
     'endpoint_denied': ('Сбой в работе программы: '
                         f'Эндпоинт [{ENDPOINT}]{ENDPOINT} недоступен'),
-    'bad_response_format': 'Неверный формат данных "response"',
+    'bad_response_format': ('Неверный формат данных "response", '
+                            'ожидался словарь'),
     'bad_homework_format': 'Неверный формат данных "homework"',
     'missing_homework': 'Отсутствует ключ "homework"',
     'has_not_homework': 'Отсутствует домашняя работа',
@@ -39,7 +40,11 @@ EXCEPTION_MESSAGES: Dict[str, str] = {
                            'в список ожидаемых в HOMEWORK_VERDICTS'),
     'server_error': 'Сбой в работе программы',
     'bad_request': 'При обработке вашего запроса '
-                   'произошло неоднозначное исключение.'
+                   'произошло неоднозначное исключение.',
+    'base_message': ('HTTP Status: {}; '
+                     'Parameters: {}; '
+                     'Message: {}; '
+                     'Response: {}')
 }
 
 logger = logging.getLogger(__name__)
@@ -94,10 +99,22 @@ def get_api_answer(timestamp) -> dict:
     try:
         response = requests.get(**params)
         if response.status_code != HTTPStatus.OK:
-            raise BadHTTPStatusError(f"HTTP Status: {response.status_code}"
-                                     + EXCEPTION_MESSAGES['endpoint_denied'])
+            raise BadHTTPStatusError(
+                EXCEPTION_MESSAGES['base_message'].format(
+                    response.status_code,
+                    params,
+                    EXCEPTION_MESSAGES['endpoint_denied'],
+                    response
+                )
+            )
     except requests.RequestException as error:
-        raise BadRequestError(EXCEPTION_MESSAGES['bad_request'] + f'| {error}')
+        message = EXCEPTION_MESSAGES['base_message'].format(
+            response.status_code,
+            params,
+            EXCEPTION_MESSAGES['endpoint_denied'],
+            response
+        )
+        raise BadRequestError(message + f"Error: {error}")
     return response.json()
 
 
@@ -108,7 +125,9 @@ def check_response(response):
     Функция возвращает первый элемент в списке "homeworks"
     """
     if not isinstance(response, dict):
-        raise TypeError(EXCEPTION_MESSAGES['bad_response_format'])
+        message = (EXCEPTION_MESSAGES['bad_response_format']
+                   + f'| Вернулся: {type(response)} ')
+        raise TypeError(message)
 
     homeworks = response.get('homeworks')
 
@@ -145,7 +164,7 @@ def main() -> None:
     """Основная логика работы бота."""
     if not check_tokens():
         logger.critical('Программа принудительно остановлена')
-        exit('Программа принудительно остановлена')
+        exit('Программа остановлена: Отсутствуют требуемые токены')
 
     bot = telegram.Bot(token=TELEGRAM_TOKEN)
     timestamp = int(time.time())
@@ -164,12 +183,11 @@ def main() -> None:
                 HomeworkError,
                 TypeError) as error:
             logger.error(error)
+            send_message(bot, error)
         except IndexError:
             message = 'Статус домашней работы не изменился!'
             send_message(bot, message)
             logging.info(message)
-        except Exception:
-            send_message(bot, EXCEPTION_MESSAGES['server_error'])
         finally:
             time.sleep(RETRY_PERIOD)
 
